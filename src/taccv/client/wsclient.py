@@ -27,6 +27,7 @@ from taccv.crypto.secure import secure_aad, require_aead
 from .errors import ProtocolError
 from .state import ClientState
 
+
 class WSClient:
     def __init__(self, url: str, session_code: str, role: ROLE, password: bytes, logger):
         self.url = url.rstrip("/")
@@ -40,12 +41,17 @@ class WSClient:
         self.state = ClientState(role=role, sid=b"")
         self._pending: Dict[str, asyncio.Future] = {}
         self._out_of_order_count = 0
+
         self._pake_state = None
         self._hs_state = None
 
         self._rx_task: Optional[asyncio.Task] = None
         self._rx_queue: asyncio.Queue = asyncio.Queue()
         self._running = False
+
+    # -------------------------
+    # Transport
+    # -------------------------
 
     async def connect(self):
         import websockets
@@ -93,6 +99,45 @@ class WSClient:
                 continue
         return None
 
+    async def _send_raw(self, o: Dict[str, Any]):
+        if not self.ws:
+            raise ProtocolError("not connected")
+        o["proto"] = PROTO_NAME
+        o["ver"] = PROTO_VER
+        await self.ws.send(json_dumps_sorted(o))
+
+    async def send_packet(self, kind: str, payload: Dict[str, Any], op: str = "req"):
+        self.state.seq_out += 1
+        seq = self.state.seq_out
+
+        wire_payload = {("rid" if k == "id" else k): v for k, v in payload.items()}
+        p = {"kind": kind, "seq": seq, "op": op, **wire_payload}
+
+        if self.state.transcript:
+            self.state.transcript.record(self.role, kind, seq, p)
+
+        await self._send_raw({"type": "packet", "payload": p})
+
+    async def request(self, kind: str, payload: Dict[str, Any], timeout: float = 15.0) -> Any:
+        req_id = secrets.token_hex(8)
+        fut = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+        await self.send_packet(kind, {"id": req_id, **payload}, op="req")
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            raise ProtocolError(f"Request timeout for {kind}")
+
+    async def abort(self, reason: str, code: str = AbortCode.INTERNAL_ERROR):
+        await self.send_packet("abort", {"reason": reason, "code": code})
+        self.state.phase = Phase.ABORTED
+        raise ProtocolError(f"Aborted: {reason}")
+
+    # -------------------------
+    # Peer message handling
+    # -------------------------
+
     def _validate_message_phase(self, kind: str) -> bool:
         phase = self.state.phase
         if kind == "profile_hello":
@@ -127,40 +172,6 @@ class WSClient:
         elif msg_type == "peer_left":
             self.logger.info("peer_disconnected", role=self.role, peer=self.peer)
 
-    async def _send_raw(self, o: Dict[str, Any]):
-        if not self.ws:
-            raise ProtocolError("not connected")
-        o["proto"] = PROTO_NAME
-        o["ver"] = PROTO_VER
-        await self.ws.send(json_dumps_sorted(o))
-
-    async def send_packet(self, kind: str, payload: Dict[str, Any], op: str = "req"):
-        self.state.seq_out += 1
-        seq = self.state.seq_out
-        wire_payload = {("rid" if k == "id" else k): v for k, v in payload.items()}
-        p = {"kind": kind, "seq": seq, "op": op, **wire_payload}
-
-        if self.state.transcript:
-            self.state.transcript.record(self.role, kind, seq, p)
-
-        await self._send_raw({"type": "packet", "payload": p})
-
-    async def request(self, kind: str, payload: Dict[str, Any], timeout: float = 15.0) -> Any:
-        req_id = secrets.token_hex(8)
-        fut = asyncio.get_event_loop().create_future()
-        self._pending[req_id] = fut
-        await self.send_packet(kind, {"id": req_id, **payload}, op="req")
-        try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            self._pending.pop(req_id, None)
-            raise ProtocolError(f"Request timeout for {kind}")
-
-    async def abort(self, reason: str, code: str = AbortCode.INTERNAL_ERROR):
-        await self.send_packet("abort", {"reason": reason, "code": code})
-        self.state.phase = Phase.ABORTED
-        raise ProtocolError(f"Aborted: {reason}")
-
     async def _handle_peer(self, from_role: ROLE, msg: Dict[str, Any]):
         if msg.get("type") != "packet":
             return
@@ -176,12 +187,14 @@ class WSClient:
         if op not in ("req", "resp"):
             await self.abort(f"Invalid op value: {op}", AbortCode.INVALID_MESSAGE)
 
+        # connection ID sequence reset
         if kind == "profile_hello":
             conn_id = payload.get("conn_id")
             if conn_id and conn_id != self.state.peer_conn_id:
                 self.state.peer_conn_id = conn_id
                 self.state.peer_seq_in = 0
 
+        # seq monotonic
         if REQUIRE_SEQ_MONOTONIC and seq and seq <= self.state.peer_seq_in:
             self._out_of_order_count += 1
             return
@@ -192,19 +205,23 @@ class WSClient:
 
         req_id = payload.get("rid")
 
+        # Requests we might need to buffer
         if op == "req" and kind in ["profile_hello", "pake_hello", "hs_hello"]:
             if not req_id:
                 await self.abort(f"Request {kind} missing rid", AbortCode.INVALID_MESSAGE)
             await self._handle_request(kind, req_id, payload, from_role)
             return
 
+        # Responses to our requests
         if op == "resp":
             if not req_id:
                 await self.abort(f"Response {kind} missing rid", AbortCode.INVALID_MESSAGE)
-            if req_id in self._pending:
-                self._pending.pop(req_id).set_result(payload)
+            fut = self._pending.pop(req_id, None)
+            if fut:
+                fut.set_result(payload)
             return
 
+        # Confirmations / secure
         if kind == "pake_confirm":
             self.state.peer_pake_confirm = validate_base64(payload["tag_b64"], "pake_confirm", 32, 32)
         elif kind == "hs_auth":
@@ -220,20 +237,75 @@ class WSClient:
             raise ProtocolError(f"peer aborted ({code}): {reason}")
 
     async def _handle_request(self, kind: str, req_id: str, payload: Dict[str, Any], from_role: ROLE):
-        response_payload = {}
+        """
+        Restore original behavior:
+        - If peer asks for pake_hello / hs_hello before we have state ready, buffer it.
+        - When state becomes ready, we pop inbox and respond.
+        """
+        body = {k: v for k, v in payload.items() if k not in ["rid", "op", "seq", "kind"]}
+
+        # Buffer early-arrival for PAKE/HS
+        if kind in ("pake_hello", "hs_hello"):
+            self.state.inbox[kind].append({
+                "rid": req_id,
+                "seq": payload.get("seq", 0),
+                "kind": kind,
+                "from_role": from_role,
+                "body": body,
+            })
+
+        # profile_hello always respond immediately
         if kind == "profile_hello":
-            response_payload = {"profiles": SUPPORTED_PROFILES, "min_profile": MIN_PROFILE, "conn_id": secrets.token_hex(8)}
-        elif kind == "pake_hello":
-            if self._pake_state:
-                response_payload = {"msg_b64": b64e(self._pake_state["msg_out"])}
-            else:
+            await self.send_packet(kind, {"id": req_id, "profiles": SUPPORTED_PROFILES, "min_profile": MIN_PROFILE, "conn_id": secrets.token_hex(8)}, op="resp")
+            return
+
+        # pake_hello: respond only if we have our pake state ready
+        if kind == "pake_hello":
+            if not self._pake_state:
+                self.logger.debug("deferred_pake_response", rid=req_id)
                 return
-        elif kind == "hs_hello":
-            if self._hs_state:
-                response_payload = {"pub_b64": b64e(self._hs_state["pub_raw"]), "nonce_b64": b64e(self._hs_state["nonce"])}
-            else:
+            await self.send_packet(kind, {"id": req_id, "msg_b64": b64e(self._pake_state["msg_out"])}, op="resp")
+            # drop the just-served inbox entry
+            if self.state.inbox["pake_hello"] and self.state.inbox["pake_hello"][0]["rid"] == req_id:
+                self.state.inbox["pake_hello"].pop(0)
+            return
+
+        # hs_hello: respond only if we have our hs state ready
+        if kind == "hs_hello":
+            if not self._hs_state:
+                self.logger.debug("deferred_hs_response", rid=req_id)
                 return
-        await self.send_packet(kind, {"id": req_id, **response_payload}, op="resp")
+            await self.send_packet(kind, {"id": req_id, "pub_b64": b64e(self._hs_state["pub_raw"]), "nonce_b64": b64e(self._hs_state["nonce"])}, op="resp")
+            if self.state.inbox["hs_hello"] and self.state.inbox["hs_hello"][0]["rid"] == req_id:
+                self.state.inbox["hs_hello"].pop(0)
+            return
+
+    async def _check_inbox(self, kind: str) -> Optional[Dict[str, Any]]:
+        if self.state.inbox[kind]:
+            return self.state.inbox[kind].pop(0)
+        return None
+
+    async def _flush_deferred(self):
+        """
+        If we have deferred inbox requests and we are now ready, respond.
+        """
+        # PAKE deferred
+        if self._pake_state and self.state.inbox["pake_hello"]:
+            entry = self.state.inbox["pake_hello"][0]
+            rid = entry["rid"]
+            await self.send_packet("pake_hello", {"id": rid, "msg_b64": b64e(self._pake_state["msg_out"])}, op="resp")
+            self.state.inbox["pake_hello"].pop(0)
+
+        # HS deferred
+        if self._hs_state and self.state.inbox["hs_hello"]:
+            entry = self.state.inbox["hs_hello"][0]
+            rid = entry["rid"]
+            await self.send_packet("hs_hello", {"id": rid, "pub_b64": b64e(self._hs_state["pub_raw"]), "nonce_b64": b64e(self._hs_state["nonce"])}, op="resp")
+            self.state.inbox["hs_hello"].pop(0)
+
+    # -------------------------
+    # Secure channel
+    # -------------------------
 
     async def _handle_secure(self, from_role: ROLE, payload: Dict[str, Any]):
         if not self.state.recv_key or not self.state.th or not self.state.nonce_base_recv:
@@ -288,6 +360,10 @@ class WSClient:
         await self.send_packet("secure_msg", {"seq2": seq2, "blob_b64": b64e(ct)})
         print(f"[{self.role}] -> {self.peer} ({seq2}): {text}")
 
+    # -------------------------
+    # Lifecycle
+    # -------------------------
+
     async def close(self):
         self._running = False
         if self._rx_task:
@@ -307,9 +383,11 @@ class WSClient:
     async def run(self, demo_message: str = ""):
         try:
             await self.connect()
-            self.state.phase = Phase.PROFILE_NEGOTIATING
 
+            # ---- profile negotiation ----
+            self.state.phase = Phase.PROFILE_NEGOTIATING
             resp = await self.request("profile_hello", {"profiles": SUPPORTED_PROFILES, "min_profile": MIN_PROFILE, "conn_id": secrets.token_hex(8)})
+
             peer_profiles = resp.get("profiles", [])
             if not peer_profiles:
                 await self.abort("No profiles supported by peer", AbortCode.PROFILE_MISMATCH)
@@ -323,17 +401,31 @@ class WSClient:
             self.logger.info("profile_negotiated", role=self.role, profile=negotiated)
 
             self.state.transcript = Transcript(profile=negotiated)
+
+            # ---- PAKE ----
             self.state.phase = Phase.PAKE
             self._pake_state = pake_init(self.role, self.password, self.state.sid, negotiated)
 
-            resp = await self.request("pake_hello", {"msg_b64": b64e(self._pake_state["msg_out"])})
-            peer_msg_b64 = resp.get("msg_b64")
-            if not peer_msg_b64:
-                await self.abort("pake_hello missing msg_b64", AbortCode.INVALID_MESSAGE)
+            # if peer already asked us, respond and reuse their message
+            inbox_msg = await self._check_inbox("pake_hello")
+            if inbox_msg:
+                rid = inbox_msg["rid"]
+                await self.send_packet("pake_hello", {"id": rid, "msg_b64": b64e(self._pake_state["msg_out"])}, op="resp")
+                peer_msg_b64 = inbox_msg["body"].get("msg_b64")
+                if not peer_msg_b64:
+                    await self.abort("pake_hello missing msg_b64", AbortCode.INVALID_MESSAGE)
+            else:
+                resp = await self.request("pake_hello", {"msg_b64": b64e(self._pake_state["msg_out"])})
+                peer_msg_b64 = resp.get("msg_b64")
+                if not peer_msg_b64:
+                    await self.abort("pake_hello response missing msg_b64", AbortCode.INVALID_MESSAGE)
 
             peer_msg = validate_base64(peer_msg_b64, "pake_msg", 32, 64)
             self.state.k0 = pake_finish_reduced_timing(self._pake_state, peer_msg, self.state.sid, negotiated)
             self._pake_state = None
+
+            # flush any deferred requests now that we can’t answer PAKE anymore
+            await self._flush_deferred()
 
             self.state.recon_th = self.state.transcript.digest()
 
@@ -354,14 +446,24 @@ class WSClient:
             self.state.phase = Phase.PAKE_DONE
             self.logger.info("PAKE_SUCCESS", role=self.role, sas6=sas6(self.state.k0, self.state.sid, negotiated))
 
+            # ---- Handshake ----
             self.state.phase = Phase.HANDSHAKING
             self._hs_state = hs_init(self.role, self.state.sid, negotiated, self.state.k0)
 
-            resp = await self.request("hs_hello", {"pub_b64": b64e(self._hs_state["pub_raw"]), "nonce_b64": b64e(self._hs_state["nonce"])})
-            peer_pub_b64 = resp.get("pub_b64")
-            peer_nonce_b64 = resp.get("nonce_b64")
-            if not peer_pub_b64 or not peer_nonce_b64:
-                await self.abort("hs_hello missing fields", AbortCode.INVALID_MESSAGE)
+            inbox_msg = await self._check_inbox("hs_hello")
+            if inbox_msg:
+                rid = inbox_msg["rid"]
+                await self.send_packet("hs_hello", {"id": rid, "pub_b64": b64e(self._hs_state["pub_raw"]), "nonce_b64": b64e(self._hs_state["nonce"])}, op="resp")
+                peer_pub_b64 = inbox_msg["body"].get("pub_b64")
+                peer_nonce_b64 = inbox_msg["body"].get("nonce_b64")
+                if not peer_pub_b64 or not peer_nonce_b64:
+                    await self.abort("hs_hello missing fields", AbortCode.INVALID_MESSAGE)
+            else:
+                resp = await self.request("hs_hello", {"pub_b64": b64e(self._hs_state["pub_raw"]), "nonce_b64": b64e(self._hs_state["nonce"])})
+                peer_pub_b64 = resp.get("pub_b64")
+                peer_nonce_b64 = resp.get("nonce_b64")
+                if not peer_pub_b64 or not peer_nonce_b64:
+                    await self.abort("hs_hello response missing fields", AbortCode.INVALID_MESSAGE)
 
             peer_pub_raw = validate_base64(peer_pub_b64, "hs_pub", 32, 32)
             peer_nonce = validate_base64(peer_nonce_b64, "hs_nonce", 16, 16)
@@ -373,6 +475,8 @@ class WSClient:
             self.state.nonce_base_recv = derived["nonce_base_recv"]
             self._hs_state = None
 
+            await self._flush_deferred()
+
             my_hs_tag = hs_auth_tag(self.state.master, self.role, self.state.th, negotiated)
             await self.send_packet("hs_auth", {"tag_b64": b64e(my_hs_tag)})
 
@@ -383,10 +487,7 @@ class WSClient:
             if self.state.peer_hs_auth is None:
                 await self.abort("Handshake auth timeout", AbortCode.TIMEOUT)
 
-            exp_peer_hs = hs_auth_tag(self.state.master, self.state.role if self.peer == self.state.role else self.peer, self.state.th, negotiated)
-            # NOTE: the original expects peer role; keep correct compare:
             exp_peer_hs = hs_auth_tag(self.state.master, self.peer, self.state.th, negotiated)
-
             if not safe_compare(exp_peer_hs, self.state.peer_hs_auth, 32):
                 await self.abort("Handshake auth mismatch", AbortCode.AUTH_FAILED)
 
@@ -423,3 +524,4 @@ class WSClient:
 
         finally:
             await self.close()
+
